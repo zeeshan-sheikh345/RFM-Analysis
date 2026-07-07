@@ -1,0 +1,117 @@
+-- RFM Analysis using Percent_Rank based scoring (SQLite)
+
+WITH
+-- 1. Analysis date
+params AS (
+    SELECT '2023-06-11' AS as_of_date
+),
+
+-- 2. Aggregate transactions to customer level
+cust_base AS (
+    SELECT
+        CustomerID,
+        MAX(PurchaseDate) AS LastPurchaseDate,
+        COUNT(*) AS Frequency,
+        SUM(TransactionAmount) AS Monetary
+    FROM rfm_data
+    GROUP BY CustomerID
+),
+
+-- 3. Calculate Recency
+cust_rfm_raw AS (
+    SELECT
+        c.CustomerID,
+        c.LastPurchaseDate,
+        c.Frequency,
+        c.Monetary,
+        CAST(
+            JULIANDAY(p.as_of_date) - JULIANDAY(c.LastPurchaseDate)
+            AS INTEGER
+        ) AS Recency
+    FROM cust_base c
+    CROSS JOIN params p
+),
+
+-- 4. Calculate percentiles
+rfm_percentiles AS (
+    SELECT
+        CustomerID,
+        Recency,
+        Frequency,
+        Monetary,
+
+        -- Recency: lower is better
+        PERCENT_RANK() OVER (ORDER BY Recency) AS recency_pct,
+
+        -- Frequency: higher is better
+        PERCENT_RANK() OVER (ORDER BY Frequency) AS frequency_pct,
+
+        -- Monetary: higher is better
+        PERCENT_RANK() OVER (ORDER BY Monetary) AS monetary_pct
+    FROM cust_rfm_raw
+),
+
+-- 5. Convert percentiles into RFM scores
+rfm_scored AS (
+    SELECT
+        CustomerID,
+        Recency,
+        Frequency,
+        Monetary,
+
+        -- Recency scoring
+        CASE
+            WHEN recency_pct <= 0.2 THEN 5
+            WHEN recency_pct <= 0.4 THEN 4
+            WHEN recency_pct <= 0.6 THEN 3
+            WHEN recency_pct <= 0.8 THEN 2
+            ELSE 1
+        END AS R_Score,
+
+        -- Frequency scoring (vice versa)
+        CASE
+            WHEN frequency_pct <= 0.2 THEN 1
+            WHEN frequency_pct <= 0.4 THEN 2
+            WHEN frequency_pct <= 0.6 THEN 3
+            WHEN frequency_pct <= 0.8 THEN 4
+            ELSE 5
+        END AS F_Score,
+
+        -- Monetary scoring (vice versa)
+        CASE
+            WHEN monetary_pct <= 0.2 THEN 1
+            WHEN monetary_pct <= 0.4 THEN 2
+            WHEN monetary_pct <= 0.6 THEN 3
+            WHEN monetary_pct <= 0.8 THEN 4
+            ELSE 5
+        END AS M_Score
+    FROM rfm_percentiles
+),
+
+-- 6. Segment customers
+rfm_segmented AS (
+    SELECT
+        CustomerID,
+        Recency,
+        Frequency,
+        Monetary,
+        R_Score,
+        F_Score,
+        M_Score,
+        (R_Score + F_Score + M_Score) AS RFM_Score,
+        'R' || R_Score || 'F' || F_Score || 'M' || M_Score AS RFM_Code,
+        CASE
+            WHEN R_Score >= 4 AND F_Score >= 4 AND M_Score >= 4 THEN 'Champions'
+            WHEN F_Score >= 4 AND R_Score >= 3 THEN 'Loyal'
+            WHEN R_Score <= 2 AND F_Score >= 3 THEN 'At Risk'
+            WHEN R_Score >= 4 AND F_Score <= 2 THEN 'New / Occasional'
+            WHEN R_Score <= 2 AND F_Score <= 2 THEN 'Dormant'
+            ELSE 'Others'
+        END AS Segment
+    FROM rfm_scored
+)
+
+-- 7. Final output
+SELECT *
+FROM rfm_segmented
+ORDER BY RFM_Score DESC, Monetary DESC;
